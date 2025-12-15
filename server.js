@@ -1,7 +1,8 @@
 // ===============================================================================
-// UNIFIED EARNINGS & WITHDRAWAL API v3.2 (DIRECT EOA TRANSFER CONFIRMED)
+// UNIFIED EARNINGS & WITHDRAWAL API v3.3 (FINAL FIX: WALLET VERIFICATION & GAS REFINEMENT)
 // - Confirms withdrawal is a direct EOA (TREASURY_WALLET) transfer, not a contract call.
-// - Decouples TREASURY_WALLET (Source/Gas) from PAYOUT_WALLET (Destination).
+// - FIX: Overwrites hardcoded TREASURY_WALLET with the actual address derived from PRIVATE_KEY.
+// - FIX: Uses robust gas calculation in executeOnChainWithdrawal to prevent INSUFFICIENT_FUNDS errors.
 // ===============================================================================
 
 const express = require('express');
@@ -20,9 +21,9 @@ const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 // ===============================================================================
 
 // Destination for all withdrawals. MUST be set in your Railway environment variables.
-const PAYOUT_WALLET = process.env.PAYOUT_WALLET || '0xMUST_SET_PAYOUT_WALLET_IN_ENV'; 
-// Source Wallet: The EOA associated with your PRIVATE_KEY (where profits land and gas is held).
-const TREASURY_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C'; 
+const PAYOUT_WALLET = process.env.PAYOUT_WALLET || '0xMUST_SET_PAYOUT_WALLET_IN_ENV'; 
+// Source Wallet: This will be overwritten by the actual address derived from PRIVATE_KEY in initProvider().
+let TREASURY_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C'; 
 
 const FLASH_API = 'https://theflash-production.up.railway.app';
 const MEV_CONTRACTS = [
@@ -34,6 +35,7 @@ const MEV_CONTRACTS = [
 
 const ETH_PRICE = 3450;
 const MIN_GAS_ETH = 0.003; 
+const GAS_RESERVE_ETH = 0.003; // Safety margin for gas reserve
 const FLASH_LOAN_AMOUNT = 100;
 
 // AUTO-WITHDRAWAL CONFIGURATION
@@ -46,7 +48,7 @@ let autoWithdrawalStatus = 'Inactive (Awaiting server start)';
 let autoWithdrawalRuns = 0;
 
 // ===============================================================================
-// STRATEGIES & AI CONFIG (Omitted for brevity)
+// STRATEGIES & AI CONFIG
 // ===============================================================================
 
 const STRATEGY_TYPES = [
@@ -99,7 +101,7 @@ let arbitrageOpportunities = [];
 let lastAIScanTime = Date.now();
 
 // ===============================================================================
-// RPC ENDPOINTS (Omitted for brevity)
+// RPC ENDPOINTS
 // ===============================================================================
 const RPC_URLS = [
   'https://ethereum-rpc.publicnode.com',
@@ -126,7 +128,7 @@ let totalRecycled = 0;
 let autoRecycleEnabled = true;
 
 // ===============================================================================
-// PROVIDER INITIALIZATION & UTILITIES (Retained)
+// PROVIDER INITIALIZATION & UTILITIES (FIXED)
 // ===============================================================================
 
 async function initProvider() {
@@ -149,6 +151,8 @@ async function initProvider() {
       
       if (PRIVATE_KEY) {
         signer = new ethers.Wallet(PRIVATE_KEY, provider);
+        // CRITICAL FIX: Overwrite hardcoded address with the actual EOA address.
+        TREASURY_WALLET = signer.address; 
         console.log('✅ Connected at block: ' + (await provider.getBlockNumber()) + ' | Wallet: ' + signer.address);
       }
       return true;
@@ -173,6 +177,7 @@ async function getReliableSigner() {
                 const newSigner = new ethers.Wallet(PRIVATE_KEY, testProvider);
                 provider = testProvider;
                 signer = newSigner;
+                TREASURY_WALLET = signer.address; // Ensure the address is updated on RPC swap too
                 currentRpcIndex = (currentRpcIndex + i) % RPC_URLS.length;
                 console.log(`[RPC SWAP] Successfully switched to RPC index ${currentRpcIndex}.`);
                 return newSigner;
@@ -210,10 +215,13 @@ async function autoRecycleToBackend() {
 
 
 // ===============================================================================
-// CORE FUNCTION: ON-CHAIN WITHDRAWAL (DIRECT EOA TRANSFER)
+// CORE FUNCTION: ON-CHAIN WITHDRAWAL (DIRECT EOA TRANSFER) - FIXED
 // ===============================================================================
 
 async function executeOnChainWithdrawal(ethAmount, toWallet) {
+    let finalEthAmount = parseFloat(ethAmount) || 0;
+    let balanceETH = 0;
+
     const currentSigner = await getReliableSigner();
 
     if (!currentSigner) {
@@ -223,28 +231,50 @@ async function executeOnChainWithdrawal(ethAmount, toWallet) {
     }
 
     try {
-        let finalEthAmount = parseFloat(ethAmount) || 0;
-        const balance = await currentSigner.provider.getBalance(currentSigner.address);
-        const balanceETH = parseFloat(ethers.formatEther(balance));
-        const GAS_BUFFER_ETH = 0.003; 
-        const maxSend = balanceETH - GAS_BUFFER_ETH;
+        const balance = await currentSigner.provider.getBalance(currentSigner.address);
+        balanceETH = parseFloat(ethers.formatEther(balance));
+        
+        // 1. Get Fee Data (EIP-1559)
+        const feeData = await currentSigner.provider.getFeeData();
+        const maxFeePerGas = feeData.maxFeePerGas;
+        const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+        const gasLimit = 21000n; // Simple ETH transfer gas limit
 
-        if (finalEthAmount <= 0) {
-            finalEthAmount = maxSend;
-        }
+        // 2. Define Estimated Gas Cost (use max fee for safety)
+        const estimatedMaxCostWei = gasLimit * maxFeePerGas; 
+        const estimatedMaxCostETH = parseFloat(ethers.formatEther(estimatedMaxCostWei));
 
-        if (finalEthAmount <= 0 || finalEthAmount > maxSend) {
-            return { success: false, error: 'Insufficient treasury balance or amount too low.', treasuryBalance: balanceETH.toFixed(6), maxWithdrawable: maxSend.toFixed(6) };
-        }
+        // CRITICAL FIX 2: REFINED MAX SEND CALCULATION 
+        // Max amount we can send = Total balance - Estimated max cost - Safety reserve (0.003 ETH)
+        const maxSend = balanceETH - estimatedMaxCostETH - GAS_RESERVE_ETH;
+        
+        if (finalEthAmount <= 0) {
+            // If amount is 0, send the maximum possible
+            finalEthAmount = maxSend;
+        }
 
-        // THIS IS THE DIRECT EOA TRANSFER
+        if (finalEthAmount <= 0) {
+            return { success: false, error: 'Insufficient treasury balance or amount too low after reserving gas.', treasuryBalance: balanceETH.toFixed(6), maxWithdrawable: maxSend.toFixed(6) };
+        }
+        
+        // Final sanity check to prevent over-sending
+        if (finalEthAmount > maxSend) {
+            console.warn(`[WITHDRAWAL] Requested amount ${finalEthAmount.toFixed(6)} exceeds maxSend ${maxSend.toFixed(6)}. Adjusting to maxSend.`);
+            finalEthAmount = maxSend;
+        }
+        
+        // Prevent sending tiny dust amounts
+        if (finalEthAmount < 0.000001) {
+             return { success: false, error: 'Calculated withdrawal amount is too small (dust).', treasuryBalance: balanceETH.toFixed(6), maxWithdrawable: maxSend.toFixed(6) };
+        }
+
+        // 3. Execute Direct EOA Transfer
         const tx = await currentSigner.sendTransaction({
             to: toWallet, // Simple ETH transfer to the destination wallet
             value: ethers.parseEther(finalEthAmount.toFixed(18)),
-            gasLimit: 21000n, // Simple ETH transfer gas limit
-            // Rest of the fields handle gas price optimization (EIP-1559)
-            maxFeePerGas: (await currentSigner.provider.getFeeData()).maxFeePerGas,
-            maxPriorityFeePerGas: (await currentSigner.provider.getFeeData()).maxPriorityFeePerGas
+            gasLimit: gasLimit, // Explicitly set 21000
+            maxFeePerGas: maxFeePerGas,
+            maxPriorityFeePerGas: maxPriorityFeePerGas
         });
         
         console.log(`[WITHDRAWAL] Transaction sent. Hash: ${tx.hash}. Waiting for confirmation...`);
@@ -253,7 +283,7 @@ async function executeOnChainWithdrawal(ethAmount, toWallet) {
 
         if (receipt && receipt.status === 1) {
              const amountUSD = (finalEthAmount * ETH_PRICE).toFixed(2);
-             console.log(`[WITHDRAWAL] SUCCESS! Direct EOA Transfer of ${finalEthAmount} ETH ($${amountUSD}) to ${toWallet.substring(0, 10)}...`);
+             console.log(`[WITHDRAWAL] SUCCESS! Direct EOA Transfer of ${finalEthAmount.toFixed(6)} ETH ($${amountUSD}) to ${toWallet.substring(0, 10)}...`);
 
              return { success: true, txHash: tx.hash, amount: finalEthAmount, amountUSD: amountUSD, blockNumber: receipt.blockNumber };
         } else {
@@ -261,7 +291,13 @@ async function executeOnChainWithdrawal(ethAmount, toWallet) {
         }
     } catch (error) {
         console.error('FINAL WITHDRAWAL ERROR:', error.message, error.code, error.transactionHash);
-        return { success: false, error: error.message, txHash: error.transactionHash };
+        
+        let detailedError = error.message;
+        if (error.code === 'INSUFFICIENT_FUNDS' || detailedError.includes('insufficient funds')) {
+             detailedError = `INSUFFICIENT FUNDS ERROR: Balance (${balanceETH.toFixed(6)} ETH) is too low to cover the requested amount and transaction fees.`;
+        }
+
+        return { success: false, error: detailedError, txHash: error.transactionHash };
     }
 }
 
@@ -286,7 +322,7 @@ async function runAutoWithdrawal() {
     }
 
     autoWithdrawalStatus = 'Executing withdrawal...';
-    const result = await executeOnChainWithdrawal(0, PAYOUT_WALLET); 
+    const result = await executeOnChainWithdrawal(0, PAYOUT_WALLET); 
 
     if (result.success) {
         lastAutoWithdrawalTime = new Date().toISOString();
@@ -302,7 +338,7 @@ async function runAutoWithdrawal() {
 // ===============================================================================
 
 app.get('/', (req, res) => {
-  res.json({ name: 'Unified Earnings & Withdrawal API', version: '3.2.0', status: 'online' });
+  res.json({ name: 'Unified Earnings & Withdrawal API', version: '3.3.0', status: 'online' });
 });
 
 app.get('/status', async (req, res) => {
@@ -316,7 +352,7 @@ app.get('/status', async (req, res) => {
     status: 'online',
     blockchain: provider ? 'connected' : 'disconnected',
     treasuryWallet: signer ? signer.address : TREASURY_WALLET,
-    payoutWallet: PAYOUT_WALLET, 
+    payoutWallet: PAYOUT_WALLET, 
     treasuryBalance: balance.toFixed(6),
     treasuryBalanceUSD: (balance * ETH_PRICE).toFixed(2),
     canTrade: balance >= MIN_GAS_ETH,
@@ -353,7 +389,7 @@ app.post('/credit-earnings', (req, res) => {
 
 async function handleWithdrawal(req, res) {
     try {
-        const withdrawUSD = 100; 
+        const withdrawUSD = 100; 
         const withdrawETH = 100 / ETH_PRICE;
         totalEarnings -= withdrawUSD;
         totalWithdrawnToCoinbase += withdrawUSD;
@@ -415,7 +451,7 @@ app.post('/execute', async (req, res) => {
   const balance = await getTreasuryBalance();
   
   // ... (gas check and strategy selection logic retained)
-  let strategy = STRATEGIES[0]; 
+  let strategy = STRATEGIES[0]; 
   const flashAmount = req.body.amount || FLASH_LOAN_AMOUNT;
 
   // REAL FLASH LOAN CALL
@@ -425,7 +461,7 @@ app.post('/execute', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         amount: flashAmount,
-        feeRecipient: TREASURY_WALLET, 
+        feeRecipient: TREASURY_WALLET, 
         mevContracts: MEV_CONTRACTS,
         strategy: { id: strategy.id, name: strategy.name, type: strategy.type, dex: strategy.dex, pair: strategy.pair }
       })
@@ -433,7 +469,7 @@ app.post('/execute', async (req, res) => {
     
     if (flashRes.ok) {
       const flashData = await flashRes.json();
-      totalEarnings += parseFloat(flashData.profitUSD || 0); 
+      totalEarnings += parseFloat(flashData.profitUSD || 0); 
       totalStrategiesExecuted++;
       return res.json({ success: true, mode: 'real', feeRecipient: TREASURY_WALLET, strategy: strategy, totalEarnings: totalEarnings.toFixed(2), flashData });
     }
@@ -458,7 +494,7 @@ initProvider().then(() => {
 
     // START AUTO-WITHDRAWAL SCHEDULE
     if (AUTO_WITHDRAWAL_ENABLED && PRIVATE_KEY) {
-        console.log(`[SCHEDULER] Auto-Withdrawal enabled. Payout to: ${PAYOUT_WALLET}. Running every ${AUTO_WITHDRAWAL_INTERVAL_MS / 1000 / 60} minutes.`);
+        console.log(`[SCHEDULER] Auto-Withdrawal enabled. Treasury: ${TREASURY_WALLET}. Payout to: ${PAYOUT_WALLET}. Running every ${AUTO_WITHDRAWAL_INTERVAL_MS / 1000 / 60} minutes.`);
         runAutoWithdrawal(); 
         setInterval(runAutoWithdrawal, AUTO_WITHDRAWAL_INTERVAL_MS);
     } else {
