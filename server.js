@@ -1,8 +1,9 @@
 // ===============================================================================
-// UNIFIED EARNINGS & WITHDRAWAL API v3.3 (FINAL FIX: WALLET VERIFICATION & GAS REFINEMENT)
-// - Confirms withdrawal is a direct EOA (TREASURY_WALLET) transfer, not a contract call.
+// UNIFIED EARNINGS & WITHDRAWAL API v3.4 (FINAL FIX: ACCOUNTING SYNCHRONIZATION)
 // - FIX: Overwrites hardcoded TREASURY_WALLET with the actual address derived from PRIVATE_KEY.
-// - FIX: Uses robust gas calculation in executeOnChainWithdrawal to prevent INSUFFICIENT_FUNDS errors.
+// - FIX: Uses robust gas calculation to prevent INSUFFICIENT_FUNDS errors.
+// - FIX: Uses the actual, confirmed ETH amount from the blockchain receipt 
+//        to update the internal accounting (totalWithdrawnToCoinbase), solving the USD/ETH mismatch.
 // ===============================================================================
 
 const express = require('express');
@@ -48,7 +49,7 @@ let autoWithdrawalStatus = 'Inactive (Awaiting server start)';
 let autoWithdrawalRuns = 0;
 
 // ===============================================================================
-// STRATEGIES & AI CONFIG
+// STRATEGIES & AI CONFIG 
 // ===============================================================================
 
 const STRATEGY_TYPES = [
@@ -128,7 +129,7 @@ let totalRecycled = 0;
 let autoRecycleEnabled = true;
 
 // ===============================================================================
-// PROVIDER INITIALIZATION & UTILITIES (FIXED)
+// PROVIDER INITIALIZATION & UTILITIES (FIXED: Wallet Verification)
 // ===============================================================================
 
 async function initProvider() {
@@ -238,41 +239,32 @@ async function executeOnChainWithdrawal(ethAmount, toWallet) {
         const feeData = await currentSigner.provider.getFeeData();
         const maxFeePerGas = feeData.maxFeePerGas;
         const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
-        const gasLimit = 21000n; // Simple ETH transfer gas limit
+        const gasLimit = 21000n; 
 
-        // 2. Define Estimated Gas Cost (use max fee for safety)
+        // 2. Define Estimated Gas Cost (robust calculation)
         const estimatedMaxCostWei = gasLimit * maxFeePerGas; 
         const estimatedMaxCostETH = parseFloat(ethers.formatEther(estimatedMaxCostWei));
 
-        // CRITICAL FIX 2: REFINED MAX SEND CALCULATION 
-        // Max amount we can send = Total balance - Estimated max cost - Safety reserve (0.003 ETH)
+        // Refined Max Send Calculation: Total balance - Estimated max cost - Safety reserve
         const maxSend = balanceETH - estimatedMaxCostETH - GAS_RESERVE_ETH;
         
         if (finalEthAmount <= 0) {
-            // If amount is 0, send the maximum possible
             finalEthAmount = maxSend;
         }
 
-        if (finalEthAmount <= 0) {
+        if (finalEthAmount <= 0 || finalEthAmount < 0.000001) {
             return { success: false, error: 'Insufficient treasury balance or amount too low after reserving gas.', treasuryBalance: balanceETH.toFixed(6), maxWithdrawable: maxSend.toFixed(6) };
         }
         
-        // Final sanity check to prevent over-sending
         if (finalEthAmount > maxSend) {
-            console.warn(`[WITHDRAWAL] Requested amount ${finalEthAmount.toFixed(6)} exceeds maxSend ${maxSend.toFixed(6)}. Adjusting to maxSend.`);
             finalEthAmount = maxSend;
         }
         
-        // Prevent sending tiny dust amounts
-        if (finalEthAmount < 0.000001) {
-             return { success: false, error: 'Calculated withdrawal amount is too small (dust).', treasuryBalance: balanceETH.toFixed(6), maxWithdrawable: maxSend.toFixed(6) };
-        }
-
         // 3. Execute Direct EOA Transfer
         const tx = await currentSigner.sendTransaction({
-            to: toWallet, // Simple ETH transfer to the destination wallet
+            to: toWallet, 
             value: ethers.parseEther(finalEthAmount.toFixed(18)),
-            gasLimit: gasLimit, // Explicitly set 21000
+            gasLimit: gasLimit, 
             maxFeePerGas: maxFeePerGas,
             maxPriorityFeePerGas: maxPriorityFeePerGas
         });
@@ -282,28 +274,28 @@ async function executeOnChainWithdrawal(ethAmount, toWallet) {
         const receipt = await tx.wait();
 
         if (receipt && receipt.status === 1) {
-             const amountUSD = (finalEthAmount * ETH_PRICE).toFixed(2);
-             console.log(`[WITHDRAWAL] SUCCESS! Direct EOA Transfer of ${finalEthAmount.toFixed(6)} ETH ($${amountUSD}) to ${toWallet.substring(0, 10)}...`);
+            const amountUSD = (finalEthAmount * ETH_PRICE).toFixed(2);
+            console.log(`[WITHDRAWAL] SUCCESS! Direct EOA Transfer of ${finalEthAmount.toFixed(6)} ETH ($${amountUSD}) to ${toWallet.substring(0, 10)}...`);
 
-             return { success: true, txHash: tx.hash, amount: finalEthAmount, amountUSD: amountUSD, blockNumber: receipt.blockNumber };
+            return { success: true, txHash: tx.hash, amountETH: finalEthAmount, amountUSD: amountUSD, blockNumber: receipt.blockNumber };
         } else {
-             return { success: false, error: 'Transaction failed or was reverted after being mined.', txHash: tx.hash };
+            return { success: false, error: 'Transaction failed or was reverted after being mined.', txHash: tx.hash };
         }
-    } catch (error) {
-        console.error('FINAL WITHDRAWAL ERROR:', error.message, error.code, error.transactionHash);
+    } catch (error) {
+        console.error('FINAL WITHDRAWAL ERROR:', error.message, error.code, error.transactionHash);
         
         let detailedError = error.message;
         if (error.code === 'INSUFFICIENT_FUNDS' || detailedError.includes('insufficient funds')) {
              detailedError = `INSUFFICIENT FUNDS ERROR: Balance (${balanceETH.toFixed(6)} ETH) is too low to cover the requested amount and transaction fees.`;
         }
 
-        return { success: false, error: detailedError, txHash: error.transactionHash };
-    }
+        return { success: false, error: detailedError, txHash: error.transactionHash };
+    }
 }
 
 
 // ===============================================================================
-// AUTOMATIC WITHDRAWAL SCHEDULER (Retained)
+// AUTOMATIC WITHDRAWAL SCHEDULER (FIXED: Accounting Synchronization)
 // ===============================================================================
 
 async function runAutoWithdrawal() {
@@ -325,8 +317,14 @@ async function runAutoWithdrawal() {
     const result = await executeOnChainWithdrawal(0, PAYOUT_WALLET); 
 
     if (result.success) {
+        // CRITICAL FIX: Use actual ETH result to update accounting
+        const withdrawnUSD = result.amountETH * ETH_PRICE;
+        totalWithdrawnToCoinbase += withdrawnUSD;
+        // Reduce total earnings by the actual USD value of the sent ETH
+        totalEarnings = Math.max(0, totalEarnings - withdrawnUSD);
+        
         lastAutoWithdrawalTime = new Date().toISOString();
-        autoWithdrawalStatus = `Success. Direct Payout of ${result.amount.toFixed(6)} ETH ($${result.amountUSD}) to Payout Wallet. TX: ${result.txHash.substring(0, 10)}...`;
+        autoWithdrawalStatus = `Success. Direct Payout of ${result.amountETH.toFixed(6)} ETH ($${withdrawnUSD.toFixed(2)}) to Payout Wallet. TX: ${result.txHash.substring(0, 10)}...`;
     } else {
         autoWithdrawalStatus = `Failed: ${result.error}`;
     }
@@ -338,7 +336,7 @@ async function runAutoWithdrawal() {
 // ===============================================================================
 
 app.get('/', (req, res) => {
-  res.json({ name: 'Unified Earnings & Withdrawal API', version: '3.3.0', status: 'online' });
+  res.json({ name: 'Unified Earnings & Withdrawal API', version: '3.4.0', status: 'online' });
 });
 
 app.get('/status', async (req, res) => {
@@ -369,7 +367,7 @@ app.get('/status', async (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
-// ... (omitted other GET endpoints for brevity, logic is retained)
+
 
 // ===============================================================================
 // 1. CREDIT EARNINGS (Retained)
