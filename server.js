@@ -1,5 +1,5 @@
 // ===============================================================================
-// UNIFIED EARNINGS & WITHDRAWAL API v4.5.0 (PERFECTED: MAX EIP-1559 SAFETY & NONCE)
+// UNIFIED EARNINGS & WITHDRAWAL API v4.6.0 (FINAL HARDENING & GRACEFUL ERROR HANDLERS)
 // ===============================================================================
 
 const express = require('express');
@@ -11,14 +11,14 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 
 // ===============================================================================
-// CONFIGURATION & SECRETS (!!! CRITICAL VULNERABILITY: KEY EXPOSED !!!)
+// CONFIGURATION & SECRETS 
 // ===============================================================================
 
 const PORT = process.env.PORT || 8080;
-// ⚠️ DANGER: Keeping PRIVATE_KEY in environment variables poses a severe security risk.
+// ⚠️ DANGER: HIGH-SEVERITY RISK: PRIVATE_KEY is exposed via environment variable.
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY; 
 if (!PRIVATE_KEY) {
-    console.error("FATAL: TREASURY_PRIVATE_KEY not set in environment variables. Code cannot run.");
+    console.error("FATAL: TREASURY_PRIVATE_KEY not set. Cannot run.");
     process.exit(1);
 }
 
@@ -31,7 +31,7 @@ let TREASURY_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C';
 const MEV_CONTRACTS = [
     '0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0', 
     '0x29983BE497D4c1D39Aa80D20Cf74173ae81D2af5', 
-    '0x1234567890123456789012345678901234567890' 
+    '0x12345678901234567890123456748901234567890' 
 ];
 
 let totalEarnings = 0;
@@ -62,10 +62,11 @@ async function initProvider() {
     } catch (e) {
         console.error(`[INIT] Failed to connect to RPC: ${e.message}. Attempting RPC failover...`);
         currentRpcIndex++;
-        if (currentRpcIndex < RPC_URLS.length + 3) { 
+        // Attempt a few cycles before giving up
+        if (currentRpcIndex < RPC_URLS.length * 2) { 
             await initProvider();
         } else {
-            console.error("FATAL: All RPCs failed after multiple attempts.");
+            console.error("FATAL: All RPCs failed after multiple attempts. Exiting.");
             process.exit(1);
         }
     }
@@ -99,7 +100,7 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
         if (transactionNonce === -1) {
             transactionNonce = await currentSigner.provider.getTransactionCount(currentSigner.address, 'latest');
         }
-        currentNonce = transactionNonce++; 
+        currentNonce = transactionNonce++; // Atomic increment
         
         const balance = await currentSigner.provider.getBalance(currentSigner.address);
         const balanceETH = parseFloat(ethers.formatEther(balance));
@@ -110,17 +111,21 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
         // --- 1. Max Priority Fee (Tip) Calculation ---
         const aggressivePriorityFee = ethers.parseUnits(MIN_AGGRESSIVE_PRIORITY_FEE_GWEI.toString(), 'gwei');
         
+        // Use provider's recommended tip, but guarantee it meets our aggressive minimum
         const maxPriorityFeePerGas = gasConfig.maxPriorityFeePerGas || 
                                      (feeData.maxPriorityFeePerGas && BigInt(feeData.maxPriorityFeePerGas) > aggressivePriorityFee 
                                       ? BigInt(feeData.maxPriorityFeePerGas)
                                       : aggressivePriorityFee);
 
         // --- 2. Max Fee Per Gas (Ceiling) Calculation ---
+        
+        // Use a robust Base Fee estimate (ensure it's BigInt)
         const estimatedBaseFee = BigInt(feeData.gasPrice || ethers.parseUnits('20', 'gwei'));
         
-        // Use 3x Base Fee for a strong safety buffer against multiple 12.5% spikes.
+        // Required minimum Max Fee: maxPriorityFee + (3 * BaseFee). The 3x multiplier provides a huge safety buffer.
         const requiredMinMaxFee = maxPriorityFeePerGas + (estimatedBaseFee * 3n); 
         
+        // Final Max Fee: Use the largest of the provider's recommendation or our calculated minimum.
         const providerMaxFee = feeData.maxFeePerGas ? BigInt(feeData.maxFeePerGas) : 0n;
         
         const maxFeePerGas = gasConfig.maxFeePerGas || 
@@ -130,6 +135,7 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
 
 
         // --- 3. Final Amount Check ---
+        // Ensure all components (gasLimit and maxFee) are BigInts for cost calculation
         const estimatedMaxCostETH = parseFloat(ethers.formatEther(gasLimit * maxFeePerGas));
         const maxSend = balanceETH - estimatedMaxCostETH - GAS_RESERVE_ETH;
 
@@ -137,7 +143,7 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
         if (finalEthAmount > maxSend) finalEthAmount = maxSend;
 
         if (finalEthAmount <= 0 || finalEthAmount < 0.000001) {
-            transactionNonce--; 
+            transactionNonce--; // Nonce is reset on local failure
             throw new Error(`Insufficient treasury balance (${balanceETH.toFixed(6)} ETH) or amount too low after reserving gas.`);
         }
 
@@ -226,6 +232,7 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
             const dests = [toWallet, auxWallet, PAYOUT_WALLET];
             const splitResults = [];
             for (let i = 0; i < 3; i++) {
+                // Must fetch reliable signer inside loop for nonce sync
                 const result = await performCoreTransfer({ currentSigner: await getReliableSigner(), ethAmount: amountPerTx, toWallet: dests[i] });
                 splitResults.push({ destination: dests[i], ...result });
                 if (!result.success) break; 
@@ -350,6 +357,22 @@ app.get('/', (req, res) => {
 
 app.use((req, res) => {
     res.status(404).json({ error: 'Endpoint not found. Check /status for available withdrawal methods.' });
+});
+
+// ===============================================================================
+// GLOBAL ERROR HANDLERS (For Graceful PM2 Restarts)
+// ===============================================================================
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[UNHANDLED REJECTION] Shutting down gracefully. Reason:', reason, 'Promise:', promise);
+    // Log details then exit, letting the process manager (like PM2) restart us
+    process.exit(1); 
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('[UNCAUGHT EXCEPTION] Shutting down gracefully. Error:', error);
+    // Log details then exit, letting the process manager (like PM2) restart us
+    process.exit(1);
 });
 
 // ===============================================================================
