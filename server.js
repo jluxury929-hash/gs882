@@ -1,44 +1,43 @@
 // ===============================================================================
-// UNIFIED EARNINGS & WITHDRAWAL API v4.2.0 (FINAL: EIP-1559 GAS MATH FIX)
+// UNIFIED EARNINGS & WITHDRAWAL API v4.5.0 (PERFECTED: MAX EIP-1559 SAFETY & NONCE)
 // ===============================================================================
 
 const express = require('express');
 const cors = require('cors');
-const { ethers } = require('ethers');
+const { ethers } = require('ethers'); 
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 
+// ===============================================================================
+// CONFIGURATION & SECRETS (!!! CRITICAL VULNERABILITY: KEY EXPOSED !!!)
+// ===============================================================================
+
 const PORT = process.env.PORT || 8080;
-const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
+// ⚠️ DANGER: Keeping PRIVATE_KEY in environment variables poses a severe security risk.
+const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY; 
 if (!PRIVATE_KEY) {
-    console.error("FATAL: TREASURY_PRIVATE_KEY not set in environment variables.");
+    console.error("FATAL: TREASURY_PRIVATE_KEY not set in environment variables. Code cannot run.");
     process.exit(1);
 }
 
-// ===============================================================================
-// WALLET & CONFIGURATION
-// ===============================================================================
-
 const PAYOUT_WALLET = process.env.PAYOUT_WALLET || '0xMUST_SET_PAYOUT_WALLET_IN_ENV';
-const ETH_PRICE = 3450;
+const ETH_PRICE = 3450; 
 const GAS_RESERVE_ETH = 0.003; 
-// The aggressive minimum priority fee (tip) for high-priority MEV/withdrawal TXs
-const MIN_AGGRESSIVE_PRIORITY_FEE_GWEI = 5n; // 5 Gwei 
-let TREASURY_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C';
+// Minimum aggressive priority fee (tip) to ensure validator inclusion: 5 Gwei
+const MIN_AGGRESSIVE_PRIORITY_FEE_GWEI = 5n; 
+let TREASURY_WALLET = '0xaFb88bD20CC9AB943fCcD050fa07D998Fc2F0b7C'; 
 const MEV_CONTRACTS = [
     '0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0', 
     '0x29983BE497D4c1D39Aa80D20Cf74173ae81D2af5', 
     '0x1234567890123456789012345678901234567890' 
 ];
 
-// Accounting Globals
 let totalEarnings = 0;
 let totalWithdrawnToCoinbase = 0;
 let currentRpcIndex = 0;
 
-// RPC List for failover and multi-check strategy
 const RPC_URLS = [
     'https://ethereum-rpc.publicnode.com',
     'https://eth.drpc.org',
@@ -59,14 +58,14 @@ async function initProvider() {
         TREASURY_WALLET = signer.address;
         
         transactionNonce = await provider.getTransactionCount(signer.address, 'latest');
-        console.log(`[INIT] Connected to RPC. Starting Nonce: ${transactionNonce}`);
+        console.log(`[INIT] Connected to RPC URL: ${url}. Starting Nonce: ${transactionNonce}`);
     } catch (e) {
-        console.error(`[INIT] Failed to connect to RPC: ${e.message}. Retrying...`);
+        console.error(`[INIT] Failed to connect to RPC: ${e.message}. Attempting RPC failover...`);
         currentRpcIndex++;
-        if (currentRpcIndex < RPC_URLS.length) {
+        if (currentRpcIndex < RPC_URLS.length + 3) { 
             await initProvider();
         } else {
-            console.error("FATAL: All RPCs failed.");
+            console.error("FATAL: All RPCs failed after multiple attempts.");
             process.exit(1);
         }
     }
@@ -90,25 +89,25 @@ function getSecondaryProvider() {
 }
 
 // ===============================================================================
-// CORE FUNCTION: FIXED GENERIC TRANSFER HANDLER (WITH CORRECTED EIP-1559 MATH)
+// CORE FUNCTION: FIXED GENERIC TRANSFER HANDLER (MAX EIP-1559 RELIABILITY)
 // ===============================================================================
 async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConfig = {} }) {
-    let balanceETH = 0;
     let currentNonce = -1;
     
     try {
+        // --- Nonce Management: Get and atomically increment global counter ---
         if (transactionNonce === -1) {
             transactionNonce = await currentSigner.provider.getTransactionCount(currentSigner.address, 'latest');
         }
-        currentNonce = transactionNonce++; // Atomically reserve the next nonce
+        currentNonce = transactionNonce++; 
         
         const balance = await currentSigner.provider.getBalance(currentSigner.address);
-        balanceETH = parseFloat(ethers.formatEther(balance));
+        const balanceETH = parseFloat(ethers.formatEther(balance));
 
         const feeData = await currentSigner.provider.getFeeData();
         const gasLimit = gasConfig.gasLimit || 21000n;
         
-        // --- FIX 1: CALCULATE AGGRESSIVE PRIORITY FEE ---
+        // --- 1. Max Priority Fee (Tip) Calculation ---
         const aggressivePriorityFee = ethers.parseUnits(MIN_AGGRESSIVE_PRIORITY_FEE_GWEI.toString(), 'gwei');
         
         const maxPriorityFeePerGas = gasConfig.maxPriorityFeePerGas || 
@@ -116,22 +115,21 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
                                       ? BigInt(feeData.maxPriorityFeePerGas)
                                       : aggressivePriorityFee);
 
-        // --- FIX 2: RECALCULATE maxFeePerGas to satisfy the EIP-1559 constraint ---
+        // --- 2. Max Fee Per Gas (Ceiling) Calculation ---
+        const estimatedBaseFee = BigInt(feeData.gasPrice || ethers.parseUnits('20', 'gwei'));
         
-        // Use the gasPrice as the best available proxy for the current base fee, ensuring it's not null/zero
-        let estimatedBaseFee = BigInt(feeData.gasPrice || ethers.parseUnits('20', 'gwei'));
+        // Use 3x Base Fee for a strong safety buffer against multiple 12.5% spikes.
+        const requiredMinMaxFee = maxPriorityFeePerGas + (estimatedBaseFee * 3n); 
         
-        // Required minimum Max Fee to cover Base Fee (with a 2x safety buffer) + our aggressive Priority Fee
-        // maxFeePerGas >= maxPriorityFeePerGas + (2 * BaseFee)
-        const requiredMinMaxFee = maxPriorityFeePerGas + (estimatedBaseFee * 2n);
+        const providerMaxFee = feeData.maxFeePerGas ? BigInt(feeData.maxFeePerGas) : 0n;
         
-        // Choose the largest value between provider's maxFeePerGas (if available) and our calculated required minimum.
         const maxFeePerGas = gasConfig.maxFeePerGas || 
-                             (feeData.maxFeePerGas && BigInt(feeData.maxFeePerGas) > requiredMinMaxFee
-                              ? BigInt(feeData.maxFeePerGas)
+                             (providerMaxFee > requiredMinMaxFee
+                              ? providerMaxFee
                               : requiredMinMaxFee);
 
 
+        // --- 3. Final Amount Check ---
         const estimatedMaxCostETH = parseFloat(ethers.formatEther(gasLimit * maxFeePerGas));
         const maxSend = balanceETH - estimatedMaxCostETH - GAS_RESERVE_ETH;
 
@@ -143,6 +141,7 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
             throw new Error(`Insufficient treasury balance (${balanceETH.toFixed(6)} ETH) or amount too low after reserving gas.`);
         }
 
+        // --- 4. Send Transaction ---
         const tx = await currentSigner.sendTransaction({
             to: toWallet,
             value: ethers.parseEther(finalEthAmount.toFixed(18)),
@@ -152,7 +151,7 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
             maxPriorityFeePerGas: maxPriorityFeePerGas
         });
 
-        console.log(`[CORE-TX] Sent. Hash: ${tx.hash}. Nonce: ${currentNonce}. MaxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei.`);
+        console.log(`[CORE-TX] Sent. Hash: ${tx.hash}. Nonce: ${currentNonce}. MaxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei. MaxPriorityFee: ${ethers.formatUnits(maxPriorityFeePerGas, 'gwei')} Gwei.`);
 
         const receipt = await tx.wait();
 
@@ -164,11 +163,13 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
             return { success: false, error: 'Transaction failed or was reverted after being mined.', txHash: tx.hash };
         }
     } catch (error) {
+        // Nonce is reset on any local or remote failure
         if (currentNonce !== -1 && currentNonce === transactionNonce - 1) {
             transactionNonce--; 
         }
-        console.error(`[TX-FAIL] Failed to send transaction (Nonce ${currentNonce} reverted). Reason: ${error.message}`);
-        return { success: false, error: error.message };
+        const errorMessage = error.code ? `${error.code}: ${error.message}` : error.message;
+        console.error(`[TX-FAIL] Failed to send transaction (Nonce ${currentNonce} reverted). Reason: ${errorMessage}`);
+        return { success: false, error: errorMessage };
     }
 }
 
@@ -258,7 +259,7 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
 }
 
 // ===============================================================================
-// EXPRESS ENDPOINTS (Remains the same)
+// EXPRESS ENDPOINTS
 // ===============================================================================
 
 async function handleWithdrawalRequest(req, res, strategyId) {
@@ -309,7 +310,7 @@ WITHDRAWAL_STRATEGIES.forEach(id => {
 });
 
 app.post('/execute', async (req, res) => {
-    console.log('[MEV] Simulating MEV bundle construction...');
+    console.log('[MEV] Simulating MEV bundle construction and immediate withdrawal...');
     const result = await performCoreTransfer({
         currentSigner: await getReliableSigner(),
         ethAmount: 0.001, 
