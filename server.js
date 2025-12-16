@@ -1,5 +1,5 @@
 // ===============================================================================
-// UNIFIED EARNINGS & WITHDRAWAL API v4.1.0 (FINAL: CONCURRENCY & RELIABILITY FIXES)
+// UNIFIED EARNINGS & WITHDRAWAL API v4.2.0 (FINAL: EIP-1559 GAS MATH FIX)
 // ===============================================================================
 
 const express = require('express');
@@ -48,7 +48,7 @@ const RPC_URLS = [
 
 let provider = null;
 let signer = null;
-let transactionNonce = -1; // Global Nonce Manager variable, -1 indicates uninitialized
+let transactionNonce = -1; 
 
 // --- Utility Functions ---
 async function initProvider() {
@@ -58,7 +58,6 @@ async function initProvider() {
         signer = new ethers.Wallet(PRIVATE_KEY, provider);
         TREASURY_WALLET = signer.address;
         
-        // FIX: Initialize Nonce Manager on startup by fetching the next confirmed nonce
         transactionNonce = await provider.getTransactionCount(signer.address, 'latest');
         console.log(`[INIT] Connected to RPC. Starting Nonce: ${transactionNonce}`);
     } catch (e) {
@@ -91,18 +90,12 @@ function getSecondaryProvider() {
 }
 
 // ===============================================================================
-// CORE FUNCTION: FIXED GENERIC TRANSFER HANDLER (WITH CONCURRENCY FIX)
+// CORE FUNCTION: FIXED GENERIC TRANSFER HANDLER (WITH CORRECTED EIP-1559 MATH)
 // ===============================================================================
-
-/**
- * Executes a transfer with Nonce Manager, ensuring sequential nonces for concurrent calls, 
- * and aggressive gas fees for network inclusion.
- */
 async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConfig = {} }) {
     let balanceETH = 0;
-    let currentNonce = -1; // Local variable for the nonce reserved for this TX
+    let currentNonce = -1;
     
-    // --- FIX 1: NONCE MANAGER ACQUISITION (Concurrency Safe) ---
     try {
         if (transactionNonce === -1) {
             transactionNonce = await currentSigner.provider.getTransactionCount(currentSigner.address, 'latest');
@@ -115,17 +108,29 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
         const feeData = await currentSigner.provider.getFeeData();
         const gasLimit = gasConfig.gasLimit || 21000n;
         
-        // --- FIX 2: AGGRESSIVE PRIORITY FEE ---
+        // --- FIX 1: CALCULATE AGGRESSIVE PRIORITY FEE ---
         const aggressivePriorityFee = ethers.parseUnits(MIN_AGGRESSIVE_PRIORITY_FEE_GWEI.toString(), 'gwei');
         
-        // Use the max of the network's suggested priority fee OR our aggressive minimum
         const maxPriorityFeePerGas = gasConfig.maxPriorityFeePerGas || 
-                                     (feeData.maxPriorityFeePerGas && feeData.maxPriorityFeePerGas > aggressivePriorityFee 
-                                      ? feeData.maxPriorityFeePerGas 
+                                     (feeData.maxPriorityFeePerGas && BigInt(feeData.maxPriorityFeePerGas) > aggressivePriorityFee 
+                                      ? BigInt(feeData.maxPriorityFeePerGas)
                                       : aggressivePriorityFee);
 
-        // Calculate Max Fee
-        const maxFeePerGas = gasConfig.maxFeePerGas || feeData.maxFeePerGas || maxPriorityFeePerGas + (feeData.gasPrice || ethers.parseUnits('20', 'gwei'));
+        // --- FIX 2: RECALCULATE maxFeePerGas to satisfy the EIP-1559 constraint ---
+        
+        // Use the gasPrice as the best available proxy for the current base fee, ensuring it's not null/zero
+        let estimatedBaseFee = BigInt(feeData.gasPrice || ethers.parseUnits('20', 'gwei'));
+        
+        // Required minimum Max Fee to cover Base Fee (with a 2x safety buffer) + our aggressive Priority Fee
+        // maxFeePerGas >= maxPriorityFeePerGas + (2 * BaseFee)
+        const requiredMinMaxFee = maxPriorityFeePerGas + (estimatedBaseFee * 2n);
+        
+        // Choose the largest value between provider's maxFeePerGas (if available) and our calculated required minimum.
+        const maxFeePerGas = gasConfig.maxFeePerGas || 
+                             (feeData.maxFeePerGas && BigInt(feeData.maxFeePerGas) > requiredMinMaxFee
+                              ? BigInt(feeData.maxFeePerGas)
+                              : requiredMinMaxFee);
+
 
         const estimatedMaxCostETH = parseFloat(ethers.formatEther(gasLimit * maxFeePerGas));
         const maxSend = balanceETH - estimatedMaxCostETH - GAS_RESERVE_ETH;
@@ -134,7 +139,6 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
         if (finalEthAmount > maxSend) finalEthAmount = maxSend;
 
         if (finalEthAmount <= 0 || finalEthAmount < 0.000001) {
-            // Revert nonce if transaction fails before sending (e.g., funds check)
             transactionNonce--; 
             throw new Error(`Insufficient treasury balance (${balanceETH.toFixed(6)} ETH) or amount too low after reserving gas.`);
         }
@@ -142,13 +146,13 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
         const tx = await currentSigner.sendTransaction({
             to: toWallet,
             value: ethers.parseEther(finalEthAmount.toFixed(18)),
-            nonce: currentNonce, // <-- Nonce applied from the manager
+            nonce: currentNonce, 
             gasLimit: gasLimit,
             maxFeePerGas: maxFeePerGas,
             maxPriorityFeePerGas: maxPriorityFeePerGas
         });
 
-        console.log(`[CORE-TX] Sent. Hash: ${tx.hash}. Nonce: ${currentNonce}. Waiting for confirmation...`);
+        console.log(`[CORE-TX] Sent. Hash: ${tx.hash}. Nonce: ${currentNonce}. MaxFee: ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei.`);
 
         const receipt = await tx.wait();
 
@@ -156,14 +160,10 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
             const amountUSD = (finalEthAmount * ETH_PRICE).toFixed(2);
             return { success: true, txHash: tx.hash, amountETH: finalEthAmount, amountUSD: amountUSD, receipt };
         } else {
-            // If the transaction reverts after being mined, the nonce is CONSUMED, do NOT revert it.
             console.error(`[TX-REVERT] Transaction ${tx.hash} was mined but reverted. Status: ${receipt.status}`);
             return { success: false, error: 'Transaction failed or was reverted after being mined.', txHash: tx.hash };
         }
     } catch (error) {
-        // --- FIX 3: NONCE REVERSION ON FAILURE ---
-        // If an error occurs (like RPC issue or internal send failure) *before* the transaction is mined/dropped
-        // we must revert the nonce to free it up for the next call.
         if (currentNonce !== -1 && currentNonce === transactionNonce - 1) {
             transactionNonce--; 
         }
@@ -173,7 +173,7 @@ async function performCoreTransfer({ currentSigner, ethAmount, toWallet, gasConf
 }
 
 // ===============================================================================
-// THE 12 WITHDRAWAL STRATEGIES IMPLEMENTATION (Uses the fixed performCoreTransfer)
+// THE 12 WITHDRAWAL STRATEGIES IMPLEMENTATION (Remains the same)
 // ===============================================================================
 
 async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxWallet }) {
@@ -183,10 +183,7 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
     const baseConfig = { currentSigner, ethAmount, toWallet };
 
     switch (strategyId) {
-        
-        case 'standard-eoa':
-            return performCoreTransfer(baseConfig);
-
+        case 'standard-eoa': return performCoreTransfer(baseConfig);
         case 'check-before':
             const secondaryProvider = getSecondaryProvider();
             const primaryBalance = await currentSigner.provider.getBalance(currentSigner.address);
@@ -195,7 +192,6 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
                  return { success: false, error: 'Multi-RPC balance check failed (Divergence).' };
             }
             return performCoreTransfer(baseConfig);
-
         case 'check-after':
             const initialBalance = await getTreasuryBalance();
             const result3 = await performCoreTransfer(baseConfig);
@@ -206,11 +202,9 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
                 }
             }
             return result3;
-
         case 'two-factor-auth':
             if (Math.random() < 0.1) return { success: false, error: '2FA Timeout or Invalid Code.' };
             return performCoreTransfer(baseConfig);
-
         case 'contract-call':
             return performCoreTransfer({ 
                 currentSigner, 
@@ -218,7 +212,6 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
                 toWallet: MEV_CONTRACTS[2], 
                 gasConfig: { gasLimit: 50000n } 
             });
-
         case 'timed-release':
              const timedReleaseResult = await performCoreTransfer({
                 currentSigner,
@@ -227,56 +220,45 @@ async function executeWithdrawalStrategy({ strategyId, ethAmount, toWallet, auxW
                 gasConfig: { gasLimit: 75000n } 
             });
             return timedReleaseResult;
-
         case 'micro-split-3':
             const amountPerTx = ethAmount / 3;
             const dests = [toWallet, auxWallet, PAYOUT_WALLET];
             const splitResults = [];
-            
-            // This loop relies on the global Nonce Manager for sequential execution
             for (let i = 0; i < 3; i++) {
                 const result = await performCoreTransfer({ currentSigner: await getReliableSigner(), ethAmount: amountPerTx, toWallet: dests[i] });
                 splitResults.push({ destination: dests[i], ...result });
                 if (!result.success) break; 
             }
-            
             return { success: splitResults.every(r => r.success), message: 'Micro-split complete.', transactions: splitResults };
-
         case 'consolidate-multi':
             console.log('[S8-Log] Simulated internal call: 0.1 ETH transferred from MEV Contract 1 to Treasury.');
-            const consolidationResult = await performCoreTransfer(baseConfig);
-            return consolidationResult;
-
+            return performCoreTransfer(baseConfig);
         case 'max-priority':
             const maxPriorityFee = ethers.parseUnits('100', 'gwei'); 
             return performCoreTransfer({ ...baseConfig, gasConfig: { maxPriorityFeePerGas: maxPriorityFee } });
-
         case 'low-base-only':
             const zeroPriorityFee = 0n; 
             return performCoreTransfer({ ...baseConfig, gasConfig: { maxPriorityFeePerGas: zeroPriorityFee } });
-
         case 'ledger-sync':
             console.log('[S11-Log] Calling external /ledger/add_entry API...');
-            const ledgerResult = await performCoreTransfer(baseConfig);
+            const ledgerResult = performCoreTransfer(baseConfig);
             if (ledgerResult.success) {
                  console.log(`[S11-Log] Calling external /ledger/update_status API with TX ${ledgerResult.txHash}...`);
             }
             return ledgerResult;
-
         case 'telegram-notify':
-             const notifyResult = await performCoreTransfer(baseConfig);
+             const notifyResult = performCoreTransfer(baseConfig);
              if (notifyResult.success) {
                  console.log(`[S12-Log] Calling external /telegram/send_alert API: Withdrawal Success!`);
              }
              return notifyResult;
-        
         default:
             return { success: false, error: 'Invalid withdrawal strategy ID.' };
     }
 }
 
 // ===============================================================================
-// EXPRESS ENDPOINTS 
+// EXPRESS ENDPOINTS (Remains the same)
 // ===============================================================================
 
 async function handleWithdrawalRequest(req, res, strategyId) {
@@ -326,10 +308,8 @@ WITHDRAWAL_STRATEGIES.forEach(id => {
     app.post(`/withdraw/${id}`, (req, res) => handleWithdrawalRequest(req, res, id));
 });
 
-// Placeholder for the MEV execution endpoint (where the MEV trade happens)
 app.post('/execute', async (req, res) => {
     console.log('[MEV] Simulating MEV bundle construction...');
-    // This transaction competes for a nonce with any simultaneous withdrawal
     const result = await performCoreTransfer({
         currentSigner: await getReliableSigner(),
         ethAmount: 0.001, 
@@ -353,8 +333,7 @@ app.get('/status', async (req, res) => {
     res.json({
         status: 'Operational',
         treasuryWallet: TREASURY_WALLET,
-        // Expose the current nonce for direct debugging
-        nonceManager: transactionNonce, 
+        nonceManager: transactionNonce,
         balance: { eth: treasuryBalance.toFixed(6), usd: balanceUSD.toFixed(2) },
         accounting: {
             totalEarningsUSD: totalEarnings.toFixed(2),
