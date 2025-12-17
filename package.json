@@ -1,18 +1,15 @@
 {
   "name": "unified-earnings-withdrawal",
   "version": "1.0.0",
+  "description": "MEV Mempool Listener and Withdrawal API",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "build": "echo 'No build step required'"
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "ethers": "^6.9.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "private": true
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.1",
+    "express": "^4.19.2"
+  }
 }
